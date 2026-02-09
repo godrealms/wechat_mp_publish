@@ -2,7 +2,46 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
 import { Command } from "commander";
-import { marked } from "marked";
+import MarkdownIt from "markdown-it";
+import mdAbbr from "markdown-it-abbr";
+import mdAttrs from "markdown-it-attrs";
+import mdContainer from "markdown-it-container";
+import mdDeflist from "markdown-it-deflist";
+import mdEmoji from "markdown-it-emoji";
+import mdFootnote from "markdown-it-footnote";
+import mdIns from "markdown-it-ins";
+import mdMark from "markdown-it-mark";
+import mdSub from "markdown-it-sub";
+import mdSup from "markdown-it-sup";
+import mdTaskLists from "markdown-it-task-lists";
+import mdTexmath from "markdown-it-texmath";
+
+const md = new MarkdownIt({
+  html: true,
+  linkify: true,
+  breaks: true,
+});
+
+md.use(mdAbbr)
+  .use(mdAttrs)
+  .use(mdContainer, "info")
+  .use(mdContainer, "warning")
+  .use(mdContainer, "tip")
+  .use(mdDeflist)
+  .use(mdEmoji)
+  .use(mdFootnote)
+  .use(mdIns)
+  .use(mdMark)
+  .use(mdSub)
+  .use(mdSup)
+  .use(mdTaskLists, { enabled: true })
+  .use(mdTexmath);
+
+// WeChat rejects <input>; render task list checkboxes as plain text.
+md.renderer.rules.checkbox_input = (tokens, idx) => {
+  const checked = tokens[idx].attrGet("checked") !== null;
+  return checked ? "[x] " : "[ ] ";
+};
 
 function mustEnv(k) {
   const v = (process.env[k] || "").trim();
@@ -88,35 +127,50 @@ async function uploadContentImageUrl(token, filename, bytes) {
   return ur.url;
 }
 
-const mdImageRe = /!\[[^\]]*]\(([^)]+)\)/g;
+function extractTitleFromMarkdown(md) {
+  if (!md) return "";
+  // Prefer YAML frontmatter title if present.
+  if (md.startsWith("---")) {
+    const fmEnd = md.indexOf("\n---");
+    if (fmEnd >= 0) {
+      const fm = md.slice(3, fmEnd);
+      const m = fm.match(/^\s*title:\s*(.+)\s*$/m);
+      if (m && m[1]) return m[1].trim().replace(/^['"]|['"]$/g, "");
+    }
+  }
 
-async function rewriteMarkdownImages({ token, md, baseDir }) {
+  // Fallback to first ATX H1.
+  const h1 = md.match(/^#\s+(.+)\s*$/m);
+  if (h1 && h1[1]) return h1[1].trim();
+  return "";
+}
+
+async function rewriteImageTokens({ token, tokens, baseDir }) {
   const cache = new Map(); // hash -> wxUrl
   const uploaded = [];
 
-  // 收集匹配位置（方便从后往前替换）
-  const matches = [];
-  for (const m of md.matchAll(mdImageRe)) {
-    matches.push({ full: m[0], raw: m[1], index: m.index, len: m[0].length });
-  }
-  if (matches.length === 0) return { md, uploaded };
-
-  let out = md;
-  for (let i = matches.length - 1; i >= 0; i--) {
-    const { raw, index, len } = matches[i];
-    let ref = (raw || "").trim().replace(/^['"]|['"]$/g, "");
-    if (!ref) continue;
+  async function handleImageToken(t) {
+    const src = (t.attrGet("src") || "").trim();
+    if (!src) return;
 
     let bytes, filename;
-    if (ref.startsWith("http://") || ref.startsWith("https://")) {
-      const d = await downloadToBytes(ref);
-      bytes = Buffer.from(d.bytes);
-      filename = "img.jpg";
-    } else {
-      let p = ref;
-      if (!path.isAbsolute(p)) p = path.join(baseDir, p);
-      bytes = await fs.readFile(p);
-      filename = guessFilename(p, "img.jpg");
+    try {
+      if (src.startsWith("http://") || src.startsWith("https://")) {
+        const d = await downloadToBytes(src);
+        bytes = Buffer.from(d.bytes);
+        filename = "img.jpg";
+      } else {
+        let p = src;
+        if (!path.isAbsolute(p)) p = path.join(baseDir, p);
+        bytes = await fs.readFile(p);
+        filename = guessFilename(p, "img.jpg");
+      }
+    } catch (err) {
+      throw new Error(`image read failed for ${src}: ${err?.message || err}`);
+    }
+
+    if (!bytes || bytes.length === 0) {
+      throw new Error(`image is empty for ${src}`);
     }
 
     // 简单去重：用 sha256
@@ -124,20 +178,27 @@ async function rewriteMarkdownImages({ token, md, baseDir }) {
     const hashHex = Buffer.from(hashBuf).toString("hex");
     let wxUrl = cache.get(hashHex);
     if (!wxUrl) {
-      wxUrl = await uploadContentImageUrl(token, filename, bytes);
+      try {
+        wxUrl = await uploadContentImageUrl(token, filename, bytes);
+      } catch (err) {
+        throw new Error(`image upload failed for ${src} (bytes=${bytes.length}): ${err?.message || err}`);
+      }
       cache.set(hashHex, wxUrl);
       uploaded.push(wxUrl);
     }
 
-    // 替换括号内链接部分：用最简单方式直接替换整段图片语法里的 url
-    const before = out.slice(0, index);
-    const piece = out.slice(index, index + len);
-    const after = out.slice(index + len);
-    const replacedPiece = piece.replace(/\(([^)]+)\)/, `(${wxUrl})`);
-    out = before + replacedPiece + after;
+    t.attrSet("src", wxUrl);
   }
 
-  return { md: out, uploaded };
+  async function walk(ts) {
+    for (const t of ts) {
+      if (t.type === "image") await handleImageToken(t);
+      if (t.children && t.children.length) await walk(t.children);
+    }
+  }
+
+  await walk(tokens);
+  return { tokens, uploaded };
 }
 
 function autoDigestFromMarkdown(md, n) {
@@ -183,10 +244,114 @@ async function cmdUploadThumb({ file, url }) {
   if (mr.url) console.log("thumb_url:", mr.url);
 }
 
+function stripTaskListInputs(html) {
+  return html.replace(/<input\b[^>]*type="checkbox"[^>]*>/gi, (m) => {
+    const checked = /\bchecked\b/i.test(m);
+    return checked ? "[x] " : "[ ] ";
+  });
+}
+
+function stripTags(s) {
+  return s.replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
+}
+
+function replaceTables(html) {
+  return html.replace(/<table[\s\S]*?<\/table>/gi, (table) => {
+    const rows = table.match(/<tr[\s\S]*?<\/tr>/gi) || [];
+    const lines = rows.map((row) => {
+      const cells = row.match(/<(?:th|td)[\s\S]*?<\/(?:th|td)>/gi) || [];
+      return cells.map((c) => stripTags(c)).join(" | ");
+    });
+    if (lines.length === 0) return "";
+    return `<p>${lines.join("<br>")}</p>`;
+  });
+}
+
+function replaceHr(html) {
+  return html.replace(/<hr\s*\/?>/gi, "");
+}
+
+function stripLinks(html) {
+  return html.replace(/<a\b[^>]*>([\s\S]*?)<\/a>/gi, "$1");
+}
+
+function removeEmptyListItems(html) {
+  return html.replace(/<li\b[^>]*>([\s\S]*?)<\/li>/gi, (m, body) => {
+    const text = stripTags(body);
+    return text ? m : "";
+  });
+}
+
+function flattenListItemParagraphs(html) {
+  return html.replace(/<li\b([^>]*)>\s*<p>([\s\S]*?)<\/p>\s*<\/li>/gi, (m, attrs, body) => {
+    return `<li${attrs}>${body}</li>`;
+  });
+}
+
+function convertListsToParagraphs(html) {
+  let out = html;
+  out = out.replace(/<ul\b[^>]*>([\s\S]*?)<\/ul>/gi, (m, list) => {
+    const items = list.match(/<li\b[^>]*>[\s\S]*?<\/li>/gi) || [];
+    const lines = items
+      .map((li) => {
+        const body = li.replace(/^<li\b[^>]*>|<\/li>$/gi, "").trim();
+        const unwrapped = body.replace(/^\s*<p[^>]*>([\s\S]*?)<\/p>\s*$/i, "$1").trim();
+        return unwrapped ? `<p>• ${unwrapped}</p>` : "";
+      })
+      .filter(Boolean);
+    return lines.join("");
+  });
+  out = out.replace(/<ol\b[^>]*>([\s\S]*?)<\/ol>/gi, (m, list) => {
+    const items = list.match(/<li\b[^>]*>[\s\S]*?<\/li>/gi) || [];
+    const lines = items
+      .map((li, i) => {
+        const body = li.replace(/^<li\b[^>]*>|<\/li>$/gi, "").trim();
+        const unwrapped = body.replace(/^\s*<p[^>]*>([\s\S]*?)<\/p>\s*$/i, "$1").trim();
+        return unwrapped ? `<p>${i + 1}. ${unwrapped}</p>` : "";
+      })
+      .filter(Boolean);
+    return lines.join("");
+  });
+  return out;
+}
+
+function convertHeadings(html) {
+  let out = html;
+  // drop H1 (主标题不要放正文)
+  out = out.replace(/<h1\b[^>]*>[\s\S]*?<\/h1>/gi, "");
+  out = out.replace(
+      /<h2\b[^>]*>([\s\S]*?)<\/h2>/gi,
+      '<h2 style="padding:1px 12.5px;color:#fff;margin:1.2em 0 1em;border-radius:4px;display:inline-block;background-color:rgb(72,112,172);font-size:1.3em;visibility:visible;"><span leaf="" style="visibility:visible;">$1</span></h2>'
+  );
+  out = out.replace(
+      /<h3\b[^>]*>([\s\S]*?)<\/h3>/gi,
+      '<h3 style="padding:0;color:rgb(72,112,172);margin:1.2em 0 1em;font-size:1.3em;"><span leaf="">$1</span></h3>'
+  );
+  return out;
+}
+
+function styleParagraphs(html) {
+  let out = html;
+  out = out.replace(/<p>/gi, '<p style="margin:10px 0;letter-spacing:0;word-break:break-word;line-height:1.75;color:#242424">');
+  out = out.replace(/<blockquote>/gi, '<blockquote style="margin:12px 0;padding-left:12px;border-left:3px solid #e0e0e0;letter-spacing:0;word-break:break-word;color:#3a3a3a;line-height:1.75">');
+  return out;
+}
+
+function applyTheme(html) {
+  const bodyStyle =
+      "color:#242424;padding:8px 0;line-height:1.75;font-size:17px;" +
+      "font-family:'PingFang SC','Hiragino Sans GB','Helvetica Neue',Arial,sans-serif;word-break:break-word;";
+  const linkStyled = html.replace(/<a\b([^>]*)>/gi, '<a $1 style="color:#576b95;font-weight:600;text-decoration:none">');
+  const codeStyled = linkStyled
+      .replace(/<code>/gi, '<code style="background:#f7f7f7;color:#202124;padding:2px 4px;border-radius:4px">')
+      .replace(/<pre><code class="language-[^"]*">/gi, '<pre style="background:#f7f7f7;color:#202124;padding:12px;border-radius:8px;overflow:auto"><code>');
+  return `<div style="${bodyStyle}">${codeStyled}</div>`;
+}
+
 async function cmdDraft(opts) {
   const { title, author, digest, mdFile, contentSourceUrl, thumbMediaId, digestAuto, digestN } = opts;
-  if (!title || !mdFile || !thumbMediaId) {
-    console.error("missing required: --title, --md-file, --thumb-media-id");
+  if (!mdFile || !thumbMediaId) {
+    console.error("missing required: --md-file, --thumb-media-id");
     process.exit(2);
   }
 
@@ -194,20 +359,43 @@ async function cmdDraft(opts) {
   const secret = mustEnv("WECHAT_MP_APPSECRET");
   const token = await getAccessToken(appid, secret);
 
-  const md = await fs.readFile(mdFile, "utf8");
+  const mdText = await fs.readFile(mdFile, "utf8");
   const baseDir = path.dirname(mdFile);
 
-  const { md: md2, uploaded } = await rewriteMarkdownImages({ token, md, baseDir });
+  const env = {};
+  const tokens = md.parse(mdText, env);
+  const { tokens: tokens2, uploaded } = await rewriteImageTokens({ token, tokens, baseDir });
+
+  let finalTitle = (title || "").trim();
+  if (!finalTitle) finalTitle = extractTitleFromMarkdown(mdText);
+  if (!finalTitle) {
+    console.error("missing title: provide --title or add a markdown title");
+    process.exit(2);
+  }
 
   let dg = (digest || "").trim();
-  if (!dg && digestAuto) dg = autoDigestFromMarkdown(md, Number(digestN || 120));
+  if (!dg && digestAuto) dg = autoDigestFromMarkdown(mdText, Number(digestN || 120));
 
-  const contentHTML = marked.parse(md2, { gfm: true, breaks: true });
+  let contentHTML = md.renderer.render(tokens2, md.options, env);
+  contentHTML = stripTaskListInputs(contentHTML);
+  contentHTML = replaceTables(contentHTML);
+  contentHTML = replaceHr(contentHTML);
+  contentHTML = stripLinks(contentHTML);
+  contentHTML = flattenListItemParagraphs(contentHTML);
+  contentHTML = removeEmptyListItems(contentHTML);
+  contentHTML = convertListsToParagraphs(contentHTML);
+  contentHTML = convertHeadings(contentHTML);
+  contentHTML = styleParagraphs(contentHTML);
+  contentHTML = applyTheme(contentHTML);
+  if (opts.dumpHtml) {
+    console.log(contentHTML);
+    return;
+  }
 
   const draftReq = {
     articles: [
       {
-        title,
+        title: finalTitle,
         author: (author || "").trim() || undefined,
         digest: dg || undefined,
         content: contentHTML,
@@ -225,11 +413,11 @@ async function cmdDraft(opts) {
   if (dr.errcode) throw new Error(`draft add err ${dr.errcode}: ${dr.errmsg}`);
   if (!dr.media_id) throw new Error("draft add: empty media_id");
 
-  const preview = Array.from(md.trim()).slice(0, 200).join("") + (Array.from(md.trim()).length > 200 ? "..." : "");
+  const preview = Array.from(mdText.trim()).slice(0, 200).join("") + (Array.from(mdText.trim()).length > 200 ? "..." : "");
 
   console.log("ok");
   console.log("draft_media_id:", dr.media_id);
-  console.log("title:", title);
+  console.log("title:", finalTitle);
   if (dg) console.log("digest:", dg);
   console.log("md_preview:", preview.replace(/\s+/g, " ").trim());
   console.log("uploaded_content_images:", uploaded.length);
@@ -286,7 +474,7 @@ program
 
 program
     .command("draft")
-    .requiredOption("--title <title>", "article title")
+    .option("--title <title>", "article title (fallback to markdown title)")
     .requiredOption("--md-file <path>", "markdown file")
     .requiredOption("--thumb-media-id <id>", "thumb media_id")
     .option("--author <author>", "author")
@@ -294,6 +482,7 @@ program
     .option("--digest <digest>", "digest")
     .option("--digest-auto", "auto generate digest from markdown", false)
     .option("--digest-n <n>", "digest length (runes)", "120")
+    .option("--dump-html", "print rendered HTML and exit", false)
     .action((opts) =>
         cmdDraft({
           title: opts.title,
@@ -304,6 +493,7 @@ program
           thumbMediaId: opts.thumbMediaId,
           digestAuto: !!opts.digestAuto,
           digestN: opts.digestN,
+          dumpHtml: !!opts.dumpHtml,
         }).catch(fatal)
     );
 
